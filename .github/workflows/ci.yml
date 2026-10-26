@@ -19,3 +19,19 @@ jobs:
       - run: pytest
         env:
           HYPOTHESIS_PROFILE: ci
+
+  realworld:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -e ".[dev]"
+      - run: npm install --no-audit --no-fund
+        working-directory: scenarios
+      - run: pytest -m realworld
+        timeout-minutes: 15

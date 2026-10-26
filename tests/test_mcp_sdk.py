@@ -230,10 +230,19 @@ class FakeSession:
         self.replies = replies
         self.sent = []
 
+    async def call_tool(self, name, args, *, meta=None, allow_claimed=False, **kwargs):
+        from toolgraph.mcp_backend import TaskHandle
+
+        self.sent.append({"method": "tools/call", "params": {"name": name, "arguments": args, "_meta": meta}})
+        assert allow_claimed, "task handles must be accepted"
+        return TaskHandle.model_validate(self.replies["tools/call"])
+
     async def send_request(self, request, result_type):
         data = request.model_dump(by_alias=True, mode="json", exclude_none=True)
         self.sent.append(data)
         reply = self.replies[data["method"]]
+        if isinstance(reply, list):
+            reply = reply.pop(0)
         if isinstance(reply, Exception):
             raise reply
         return result_type.validate_python(reply) if hasattr(result_type, "validate_python") else result_type.model_validate(reply)
@@ -244,20 +253,24 @@ class FakeClient:
         self.session = FakeSession(replies)
 
 
+# Shapes as the official "everything" reference server sends them (tasks extension, 2026-07-28).
 TASK = {"taskId": "t-1", "status": "working", "createdAt": "2026-01-01T00:00:00Z",
-        "lastUpdatedAt": "2026-01-01T00:00:00Z", "ttl": None, "pollInterval": 1500}
+        "lastUpdatedAt": "2026-01-01T00:00:00Z", "ttlMs": 300000, "pollIntervalMs": 1500}
 
 
-def test_task_requests_follow_sdk_types():
+def test_tasks_extension_wire_shapes():
     fake = FakeClient({
-        "tools/call": {"task": TASK},
-        "tasks/get": {**TASK, "status": "input_required", "inputRequests": {
-            "q": {"method": "elicitation/create", "params": {"mode": "form", "message": "Seat?", "requestedSchema": {"type": "object", "properties": {}}}}}},
-        "tasks/result": {"content": [{"type": "text", "text": '{"ok": true}'}]},
+        "tools/call": {"resultType": "task", "content": [], **TASK},
+        "tasks/get": [
+            {**TASK, "status": "input_required", "inputRequests": {
+                "q": {"method": "elicitation/create",
+                      "params": {"mode": "form", "message": "Seat?", "requestedSchema": {"type": "object", "properties": {}}}}}},
+            {**TASK, "status": "completed", "result": {"content": [{"type": "text", "text": '{"ok": true}'}]}},
+        ],
         "tasks/update": {},
-        "tasks/cancel": {**TASK, "status": "cancelled"},
+        "tasks/cancel": {},
     })
-    backend = MCPBackend({}, task_tools={"svc.render"}, route=lambda tool: (fake, tool.split(".")[1]))
+    backend = MCPBackend({}, route=lambda tool: (fake, tool.split(".")[1]))
 
     async def main():
         started = await backend.call("svc.render", {"x": 1}, idempotency_key="k1")
@@ -265,16 +278,24 @@ def test_task_requests_follow_sdk_types():
         status = await backend.get_task("svc.render", "t-1")
         assert status.status == "input_required" and status.question.prompt == "Seat?"
         await backend.answer_task("svc.render", "t-1", status.question, {"seat": "1A"})
+        # The result rides on the completed status; there is no tasks/result.
         assert (await backend.task_result("svc.render", "t-1")).value == {"ok": True}
         await backend.cancel_task("svc.render", "t-1")
 
     asyncio.run(main())
     call, get, update = fake.session.sent[0], fake.session.sent[1], fake.session.sent[2]
-    assert call["method"] == "tools/call" and call["params"]["task"] == {}
     assert call["params"]["_meta"] == {"io.toolgraph/idempotency-key": "k1"}
     assert get == {"method": "tasks/get", "params": {"taskId": "t-1"}}
-    assert update["params"] == {"taskId": "t-1", "inputResponses": {"q": {"action": "accept", "content": {"seat": "1A"}}}}
-    assert [s["method"] for s in fake.session.sent[3:]] == ["tasks/result", "tasks/cancel"]
+    assert update == {"method": "tasks/update",
+                      "params": {"taskId": "t-1", "inputResponses": {"q": {"action": "accept", "content": {"seat": "1A"}}}}}
+    assert [s["method"] for s in fake.session.sent[3:]] == ["tasks/get", "tasks/cancel"]
+
+
+def test_task_requests_carry_the_mcp_name_header_key():
+    # Over HTTP, servers reject tasks/* requests without an Mcp-Name header naming the task.
+    from toolgraph.mcp_backend import CancelTask, GetTask, UpdateTask
+
+    assert GetTask.name_param == CancelTask.name_param == UpdateTask.name_param == "taskId"
 
 
 def test_unknown_task_is_reported_lost():

@@ -1,0 +1,9 @@
+{
+  "name": "toolgraph-scenarios",
+  "private": true,
+  "description": "Official MCP reference servers used by the real-world scenarios",
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "2.0.1",
+    "@modelcontextprotocol/server-filesystem": "2.0.1"
+  }
+}

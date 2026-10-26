@@ -176,6 +176,10 @@ class Scheduler:
             )
         self._poke()
 
+    def resolved_args(self, node_id: str) -> dict[str, Any]:
+        """A node's arguments with refs replaced by results, e.g. to read back an unknown outcome."""
+        return self._args(self.store.node(self.run_id, node_id))
+
     def _poke(self) -> None:
         if self._wake is not None:
             self._wake.set()

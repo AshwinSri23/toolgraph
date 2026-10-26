@@ -1,39 +1,38 @@
 """A backend that talks to real MCP servers through the official Python SDK.
 
-Plain ``tools/call`` (including ``InputRequiredResult`` round trips) is tested
-end to end against the SDK. MCP Tasks are experimental: ``tasks/get``,
-``tasks/result`` and ``tasks/cancel`` follow the SDK types, and ``tasks/update``
-(sending input to a paused task) has not been tested against a real server.
+Plain ``tools/call`` (including ``InputRequiredResult`` round trips) and the
+MCP Tasks extension (``io.modelcontextprotocol/tasks``, protocol 2026-07-28)
+are both tested against real servers: in-process SDK servers, and the official
+"everything" reference server over Streamable HTTP.
+
+Clients must declare the tasks extension for servers to hand out task handles::
+
+    Client(url, **client_options())
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from mcp import Client
+from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
 from mcp.shared.exceptions import MCPError
 from mcp_types import (
-    CallToolRequest,
-    CallToolRequestParams,
     CallToolResult,
-    CancelTaskRequest,
-    CancelTaskRequestParams,
-    CreateTaskResult,
     ElicitResult,
-    GetTaskPayloadRequest,
-    GetTaskPayloadRequestParams,
-    GetTaskRequest,
-    GetTaskRequestParams,
+    ErrorData,
     InputRequiredResult,
     Request,
     RequestParams,
-    TaskMetadata,
+    Result,
     TextContent,
 )
 from mcp_types.jsonrpc import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_PARAMS, REQUEST_TIMEOUT
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ConfigDict, TypeAdapter
 
 from .backend import (
     CallOutcome,
@@ -47,25 +46,82 @@ from .backend import (
     ToolFailed,
     Uncertain,
 )
+from .policy import PolicyRegistry, SideEffect, ToolPolicy
 from .scheduler import KEY_META
+
+TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
 
 # Errors after which the server may or may not have acted on the request.
 UNCERTAIN_CODES = frozenset({CONNECTION_CLOSED, REQUEST_TIMEOUT, INTERNAL_ERROR})
 
 _RAW = TypeAdapter(dict[str, Any])
-_CREATE_OR_RESULT = TypeAdapter(CreateTaskResult | CallToolResult)
 
 
-class UpdateTaskRequestParams(RequestParams):
+class TaskHandle(Result):
+    """A ``tools/call`` answered with a task (``resultType: "task"``) instead of a result."""
+
+    model_config = ConfigDict(extra="allow")
+
+    result_type: Literal["task"] = "task"
+    task_id: str
+    status: str = "working"
+    poll_interval_ms: int | None = None
+
+
+async def _unresolved(handle: TaskHandle, ctx: ClaimContext) -> CallToolResult:
+    # toolgraph records the handle and polls it itself, durably; it never asks the SDK to.
+    raise RuntimeError("toolgraph task handles are not resolved by the SDK")
+
+
+class TasksExtension(ClientExtension):
+    """Declares the tasks extension and lets ``tools/call`` return task handles."""
+
+    identifier = TASKS_EXTENSION
+
+    def claims(self) -> list[ResultClaim[Any]]:
+        return [ResultClaim(result_type="task", model=TaskHandle, resolve=_unresolved)]
+
+
+async def _input_arrives_in_band(context: Any, params: Any) -> ErrorData:
+    """Elicitation callback that declares form support but refuses mid-call pushes.
+
+    Questions reach toolgraph in band (``InputRequiredResult`` or a task's
+    ``input_required`` status) so that they survive restarts.
+    """
+    return ErrorData(code=INVALID_PARAMS, message="toolgraph answers input requests in band only")
+
+
+def client_options() -> dict[str, Any]:
+    """Keyword arguments for ``mcp.Client`` that toolgraph's MCP backend expects."""
+    return {"extensions": [TasksExtension()], "elicitation_callback": _input_arrives_in_band}
+
+
+class _TaskIdParams(RequestParams):
+    task_id: str
+
+
+class GetTask(Request[_TaskIdParams, Literal["tasks/get"]]):
+    method: Literal["tasks/get"] = "tasks/get"
+    params: _TaskIdParams
+    name_param = "taskId"
+
+
+class CancelTask(Request[_TaskIdParams, Literal["tasks/cancel"]]):
+    method: Literal["tasks/cancel"] = "tasks/cancel"
+    params: _TaskIdParams
+    name_param = "taskId"
+
+
+class _UpdateParams(RequestParams):
     task_id: str
     input_responses: dict[str, Any]
 
 
-class UpdateTaskRequest(Request[UpdateTaskRequestParams, Literal["tasks/update"]]):
-    """Send input to a task that is waiting for it (tasks extension). Untested against a real server."""
+class UpdateTask(Request[_UpdateParams, Literal["tasks/update"]]):
+    """Answer the input requests of a task that is ``input_required``."""
 
     method: Literal["tasks/update"] = "tasks/update"
-    params: UpdateTaskRequestParams
+    params: _UpdateParams
     name_param = "taskId"
 
 
@@ -132,46 +188,118 @@ def _wrap(exc: BaseException) -> Exception:
     return Uncertain(f"{type(exc).__name__}: {exc}")
 
 
-_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError, ValidationError, EOFError)
-try:  # anyio stream errors when a connection drops
-    import anyio
+class Connection:
+    """One MCP client that is reconnected after its transport fails.
 
-    _TRANSPORT_ERRORS += (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)
-except ImportError:  # pragma: no cover
-    pass
+    The SDK's HTTP transport tears down the whole client when a single POST
+    loses its connection. Each client therefore lives in its own supervisor
+    task: a transport failure ends that task (the call in flight sees an error
+    or times out, and its outcome is treated as unknown) and the next call
+    connects again.
+    """
+
+    def __init__(self, factory: Callable[[], Client]) -> None:
+        self.factory = factory
+        self.connects = 0
+        self.failures: list[str] = []
+        self._client: Client | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def client(self) -> Client:
+        async with self._lock:
+            if self._client is None or self._task is None or self._task.done():
+                await self._open()
+            assert self._client is not None
+            return self._client
+
+    async def _open(self) -> None:
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._stop = asyncio.Event()
+        self._task = asyncio.get_running_loop().create_task(self._supervise(ready))
+        await ready
+
+    async def _supervise(self, ready: asyncio.Future[None]) -> None:
+        try:
+            async with self.factory() as client:
+                self._client = client
+                self.connects += 1
+                ready.set_result(None)
+                await self._stop.wait()
+        except Exception as e:  # the transport died, or we never connected
+            self.failures.append(f"{type(e).__name__}: {e}")
+            if not ready.done():
+                # Nothing was sent, so this is a definite failure.
+                ready.set_exception(Rejected(f"could not connect: {e}"))
+        finally:
+            self._client = None
+
+    async def close(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await self._task
+            except BaseException:
+                pass
+
+
+@asynccontextmanager
+async def connect(
+    factories: Mapping[str, Callable[[], Client]], **kwargs: Any
+) -> AsyncIterator[MCPBackend]:
+    """An ``MCPBackend`` over reconnecting connections, one per server::
+
+        async with connect({"shop": lambda: Client(url, **client_options())}) as backend:
+            ...
+    """
+    connections = {name: Connection(f) for name, f in factories.items()}
+    try:
+        yield MCPBackend(connections, **kwargs)
+    finally:
+        for c in connections.values():
+            await c.close()
+
+
+Target = Client | Connection
 
 
 class MCPBackend:
-    """Route toolgraph calls to one or more connected ``mcp.Client`` instances.
+    """Route toolgraph calls to one or more MCP servers.
 
-    With several servers, tools are named ``"<server>.<tool>"``. Tools listed in
-    ``task_tools`` are called as MCP Tasks (task-augmented ``tools/call``).
+    ``servers`` maps a server name to a connected ``mcp.Client`` or a
+    :class:`Connection`; with several servers, tools are named
+    ``"<server>.<tool>"``. Create clients with ``Client(..., **client_options())``
+    so servers may answer with task handles; whether a call becomes a task is
+    the server's decision. Prefer :func:`connect`, which reconnects.
     """
 
     def __init__(
         self,
-        servers: Client | Mapping[str, Client],
+        servers: Target | Mapping[str, Target],
         *,
         separator: str = ".",
-        task_tools: Collection[str] = (),
-        task_ttl_ms: int | None = None,
-        route: Callable[[str], tuple[Client, str]] | None = None,
+        route: Callable[[str], tuple[Any, str]] | None = None,
     ) -> None:
         self.servers = servers
         self.separator = separator
-        self.task_tools = set(task_tools)
-        self.task_ttl_ms = task_ttl_ms
         self._route = route
 
-    def route(self, tool: str) -> tuple[Client, str]:
+    def route(self, tool: str) -> tuple[Any, str]:
         if self._route is not None:
             return self._route(tool)
-        if isinstance(self.servers, Client):
+        if isinstance(self.servers, (Client, Connection)):
             return self.servers, tool
         server, _, name = tool.partition(self.separator)
         if server not in self.servers or not name:
             raise Rejected(f"no server for tool {tool!r}")
         return self.servers[server], name
+
+    @staticmethod
+    async def _session(target: Any) -> Any:
+        if isinstance(target, Connection):
+            target = await target.client()
+        return target.session
 
     async def call(
         self,
@@ -182,72 +310,98 @@ class MCPBackend:
         answer: Any = None,
         question: Question | None = None,
     ) -> CallOutcome:
-        client, name = self.route(tool)
+        target, name = self.route(tool)
+        session = await self._session(target)
         meta = {KEY_META: idempotency_key} if idempotency_key else None
         input_responses = request_state = None
         if question is not None:
             input_responses = _responses(question, answer)
             request_state = question.state.get("request_state")
         try:
-            if tool in self.task_tools:
-                params = CallToolRequestParams(
-                    name=name, arguments=args, task=TaskMetadata(ttl=self.task_ttl_ms), _meta=meta,
-                    input_responses=input_responses, request_state=request_state,
-                )
-                result: Any = await client.session.send_request(CallToolRequest(params=params), _CREATE_OR_RESULT)
-            else:
-                result = await client.session.call_tool(
-                    name, args, meta=meta, input_responses=input_responses,  # type: ignore[arg-type]
-                    request_state=request_state, allow_input_required=True,
-                )
-        except MCPError as e:
+            result = await session.call_tool(
+                name, args, meta=meta, input_responses=input_responses,  # type: ignore[arg-type]
+                request_state=request_state, allow_input_required=True, allow_claimed=True,
+            )
+        except Exception as e:  # MCP errors, dropped connections, malformed replies
             raise _wrap(e) from e
-        except _TRANSPORT_ERRORS as e:
-            raise _wrap(e) from e
-        if isinstance(result, CreateTaskResult):
-            poll = result.task.poll_interval
-            return Started(result.task.task_id, poll_interval=poll / 1000 if poll else None)
+        if isinstance(result, TaskHandle):
+            poll = result.poll_interval_ms
+            return Started(result.task_id, poll_interval=poll / 1000 if poll else None)
         if isinstance(result, InputRequiredResult):
             return NeedsInput(_question(result))
         if isinstance(result, CallToolResult):
-            if result.is_error:
-                return ToolFailed(_error_text(result), result_value(result))
-            return Done(result_value(result))
+            return _outcome(result)
         raise Uncertain(f"unexpected result type {type(result).__name__}")
 
     async def _task_request(self, tool: str, request: Request[Any, Any]) -> dict[str, Any]:
-        client, _ = self.route(tool)
+        target, _ = self.route(tool)
+        session = await self._session(target)
         try:
-            return await client.session.send_request(request, _RAW)
+            return await session.send_request(request, _RAW)
         except MCPError as e:
             if e.code == INVALID_PARAMS:
                 raise TaskLost(e.error.message) from e
             raise _wrap(e) from e
-        except _TRANSPORT_ERRORS as e:
+        except Exception as e:
             raise _wrap(e) from e
 
+    async def _get(self, tool: str, task_id: str) -> dict[str, Any]:
+        return await self._task_request(tool, GetTask(params=_TaskIdParams(task_id=task_id)))
+
     async def get_task(self, tool: str, task_id: str) -> TaskStatus:
-        raw = await self._task_request(tool, GetTaskRequest(params=GetTaskRequestParams(task_id=task_id)))
+        raw = await self._get(tool, task_id)
         status = raw.get("status", "working")
         question = None
         if status == "input_required" and raw.get("inputRequests"):
-            ir = InputRequiredResult.model_validate({"inputRequests": raw["inputRequests"]})
-            question = _question(ir)
-        poll = raw.get("pollInterval")
+            question = _question(InputRequiredResult.model_validate({"inputRequests": raw["inputRequests"]}))
+        poll = raw.get("pollIntervalMs")
         return TaskStatus(status, raw.get("statusMessage"), question, poll / 1000 if poll else None)
 
     async def task_result(self, tool: str, task_id: str) -> Done | ToolFailed:
-        raw = await self._task_request(tool, GetTaskPayloadRequest(params=GetTaskPayloadRequestParams(task_id=task_id)))
-        result = CallToolResult.model_validate(raw)
-        if result.is_error:
-            return ToolFailed(_error_text(result), result_value(result))
-        return Done(result_value(result))
+        # In the tasks extension the result rides on the completed status itself.
+        raw = await self._get(tool, task_id)
+        if raw.get("status") != "completed" or "result" not in raw:
+            raise Rejected(f"task {task_id} has no result (status {raw.get('status')!r})")
+        return _outcome(CallToolResult.model_validate(raw["result"]))
 
     async def answer_task(self, tool: str, task_id: str, question: Question, answer: Any) -> None:
-        responses = {k: v.model_dump(mode="json", by_alias=True, exclude_none=True) for k, v in _responses(question, answer).items()}
-        await self._task_request(
-            tool, UpdateTaskRequest(params=UpdateTaskRequestParams(task_id=task_id, input_responses=responses))
-        )
+        responses = {
+            k: v.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for k, v in _responses(question, answer).items()
+        }
+        await self._task_request(tool, UpdateTask(params=_UpdateParams(task_id=task_id, input_responses=responses)))
 
     async def cancel_task(self, tool: str, task_id: str) -> None:
-        await self._task_request(tool, CancelTaskRequest(params=CancelTaskRequestParams(task_id=task_id)))
+        await self._task_request(tool, CancelTask(params=_TaskIdParams(task_id=task_id)))
+
+
+def _outcome(result: CallToolResult) -> Done | ToolFailed:
+    if result.is_error:
+        return ToolFailed(_error_text(result), result_value(result))
+    return Done(result_value(result))
+
+
+def policies_from_annotations(
+    tools: Any, *, prefix: str = "", registry: PolicyRegistry | None = None, **policy: Any
+) -> PolicyRegistry:
+    """Register a policy per tool from its MCP annotations (``tools`` is a ``list_tools`` result).
+
+    ``readOnlyHint`` maps to READ and ``idempotentHint`` to IDEMPOTENT_WRITE; any
+    other tool is an UNKEYED_WRITE. Annotations are hints from the server, so
+    only trust them from servers you trust, and register keyed writes yourself.
+    Tools already in ``registry`` are left alone.
+    """
+    reg = registry or PolicyRegistry()
+    for tool in getattr(tools, "tools", tools):
+        name = prefix + tool.name
+        if name in reg.policies:
+            continue
+        hints = tool.annotations
+        if hints is not None and hints.read_only_hint:
+            effect = SideEffect.READ
+        elif hints is not None and hints.idempotent_hint:
+            effect = SideEffect.IDEMPOTENT_WRITE
+        else:
+            effect = SideEffect.UNKEYED_WRITE
+        reg.register(name, ToolPolicy(side_effect=effect, **policy))
+    return reg

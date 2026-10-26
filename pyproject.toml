@@ -28,7 +28,10 @@ packages = ["src/toolgraph"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+addopts = "-q -m 'not realworld'"
+markers = [
+    "realworld: separate processes, real transports and SIGKILLs, reference MCP servers (pytest -m realworld)",
+]
 
 [tool.ruff]
 line-length = 120
